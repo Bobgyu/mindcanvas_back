@@ -49,7 +49,7 @@ app = Flask(__name__)
 CORS(app)
 
 # PostgreSQL 설정
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://your_user:your_password@localhost:5432/your_database') + '?client_encoding=UTF8'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:codelab0080**A@34.64.71.12:5432/postgres?options=-csearch_path%3Djuyeoung') + '&client_encoding=UTF8'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # 기존 설정 다시 추가
@@ -126,7 +126,7 @@ def token_required(f):
 class Drawing(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    image_path = db.Column(db.String(256), nullable=False)
+    image_data = db.Column(db.Text, nullable=False)  # Base64 이미지 데이터를 직접 저장
     analysis_result = db.Column(db.JSON, nullable=True) # JSON 타입으로 분석 결과 저장
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     updated_at = db.Column(db.DateTime, default=db.func.current_timestamp(), onupdate=db.func.current_timestamp())
@@ -919,9 +919,23 @@ def chatbot():
         image_analysis_result = data.get('image_analysis_result', None)
         
         if not openai.api_key:
+            # OpenAI API 키가 없을 때 기본 응답 제공
+            default_response = """안녕하세요! HTP(House-Tree-Person) 그림 검사에 대해 도움을 드리겠습니다.
+
+HTP 검사는 집, 나무, 사람을 그리게 하여 심리상태를 파악하는 투사적 그림검사입니다.
+
+기본적인 해석 요소들:
+🏠 집: 가족관계, 안정감, 소속감을 나타냅니다
+🌳 나무: 성장, 생명력, 자아상을 보여줍니다  
+👤 사람: 대인관계, 자아개념, 정서상태를 반영합니다
+
+더 자세한 분석을 위해서는 실제 그림을 업로드해 주세요."""
+            
             return jsonify({
-                "error": "OpenAI API 키가 설정되지 않았습니다."
-            }), 500
+                "success": True,
+                "response": default_response,
+                "message": "기본 HTP 정보를 제공했습니다."
+            })
         
         # HTP 전문 시스템 프롬프트 생성
         system_prompt = get_htp_system_prompt()
@@ -1234,19 +1248,14 @@ def save_drawing():
         if not user:
             return jsonify({"error": f"사용자 ID {user_id}에 해당하는 사용자를 찾을 수 없습니다."}), 404
 
-        # Base64 이미지 데이터를 파일로 저장
-        image = base64_to_image(image_data)
-        if image is None:
-            return jsonify({"error": "이미지 변환에 실패했습니다. 유효한 Base64 이미지 데이터를 제공해주세요."}), 400
+        # Base64 이미지 데이터 유효성 검증
+        if not image_data.startswith('data:image/'):
+            return jsonify({"error": "유효한 Base64 이미지 데이터 형식이 아닙니다."}), 400
 
-        # 고유한 파일명 생성
-        filename = f"{uuid.uuid4().hex}.png"
-        image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        image.save(image_path)
-
+        # 데이터베이스에 직접 저장 (파일로 저장하지 않음)
         new_drawing = Drawing(
             user_id=user_id,
-            image_path=image_path,
+            image_data=image_data,  # Base64 데이터를 직접 저장
             analysis_result=analysis_result
         )
         db.session.add(new_drawing)
@@ -1263,6 +1272,44 @@ def save_drawing():
         print(f"그림 저장 API 오류: {e}")
         return jsonify({"error": f"서버 오류: {str(e)}"}), 500
 
+@app.route('/api/drawings/<int:drawing_id>', methods=['PUT'])
+def update_drawing(drawing_id):
+    """기존 그림을 업데이트하는 API"""
+    try:
+        data = request.get_json()
+        image_data = data.get('image')
+        analysis_result = data.get('analysis_result')
+
+        if not image_data:
+            return jsonify({"error": "이미지 데이터가 필요합니다."}), 400
+
+        # 기존 그림 찾기
+        drawing = Drawing.query.get(drawing_id)
+        if not drawing:
+            return jsonify({"error": "그림을 찾을 수 없습니다."}), 404
+
+        # Base64 이미지 데이터 유효성 검증
+        if not image_data.startswith('data:image/'):
+            return jsonify({"error": "유효한 Base64 이미지 데이터 형식이 아닙니다."}), 400
+
+        # 그림 업데이트 (데이터베이스에 직접 저장)
+        drawing.image_data = image_data  # Base64 데이터를 직접 저장
+        if analysis_result:
+            drawing.analysis_result = analysis_result
+
+        db.session.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "그림이 성공적으로 업데이트되었습니다.",
+            "drawing_id": drawing.id
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"그림 업데이트 API 오류: {e}")
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
 @app.route('/api/drawings/<int:user_id>', methods=['GET'])
 def get_user_drawings(user_id):
     """특정 사용자의 그림 및 분석 결과를 가져오는 API"""
@@ -1275,17 +1322,22 @@ def get_user_drawings(user_id):
         
         drawings_data = []
         for drawing in drawings:
-            # 이미지 파일을 Base64로 다시 인코딩
-            with open(drawing.image_path, "rb") as image_file:
-                encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-
-            drawings_data.append({
-                "id": drawing.id,
-                "image": f"data:image/png;base64,{encoded_image}",
-                "analysis_result": drawing.analysis_result,
-                "created_at": drawing.created_at.isoformat(),
-                "updated_at": drawing.updated_at.isoformat()
-            })
+            try:
+                # 데이터베이스에서 직접 Base64 이미지 데이터 가져오기
+                if drawing.image_data:
+                    drawings_data.append({
+                        "id": drawing.id,
+                        "image": drawing.image_data,  # 이미 Base64 형식으로 저장됨
+                        "analysis_result": drawing.analysis_result,
+                        "created_at": drawing.created_at.isoformat(),
+                        "updated_at": drawing.updated_at.isoformat()
+                    })
+                else:
+                    print(f"이미지 데이터가 없습니다 (ID: {drawing.id})")
+                    continue
+            except Exception as e:
+                print(f"이미지 처리 오류 (ID: {drawing.id}): {e}")
+                continue
 
         return jsonify({
             "success": True,
