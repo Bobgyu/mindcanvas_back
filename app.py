@@ -72,6 +72,21 @@ class User(db.Model):
     def __repr__(self):
         return f'<User {self.username}>'
 
+# 감정일기 모델 정의
+class EmotionDiary(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    emotion = db.Column(db.String(50), nullable=False)  # 감정 이름
+    emotion_id = db.Column(db.String(50), nullable=False)  # 감정 ID
+    content = db.Column(db.Text, nullable=False)  # 일기 내용
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # 사용자와의 관계
+    user = db.relationship('User', backref=db.backref('emotion_diaries', lazy=True))
+
+    def __repr__(self):
+        return f'<EmotionDiary {self.id}: {self.emotion}>'
+
 # JWT 토큰 관련 함수들
 def generate_jwt_token(user_id, username):
     """JWT 토큰 생성"""
@@ -1221,32 +1236,23 @@ def reverse_geocode():
         return jsonify({"error": f"서버 오류: {str(e)}"}), 500
 
 @app.route('/api/drawings', methods=['POST'])
+@token_required
 def save_drawing():
     """사용자의 그림과 분석 결과를 저장하는 API"""
     try:
         data = request.get_json()
-        user_id = data.get('user_id') # 실제 구현에서는 JWT 등 인증 토큰에서 user_id를 가져와야 함
+        user_info = request.current_user  # JWT 토큰에서 사용자 정보 가져오기
+        user_id = user_info['user_id']
         image_data = data.get('image') # Base64 이미지 데이터
         analysis_result = data.get('analysis_result')
 
         # 디버깅: 수신된 데이터 로깅
-        print(f"[save_drawing] 수신 user_id: {user_id}")
+        print(f"[save_drawing] 인증된 user_id: {user_id}")
         print(f"[save_drawing] image_data 길이: {len(image_data) if image_data else 'None'}")
         print(f"[save_drawing] analysis_result 존재 여부: {analysis_result is not None}")
 
-        if not user_id:
-            return jsonify({"error": "사용자 ID가 필요합니다."}), 400
         if not image_data:
             return jsonify({"error": "이미지 데이터가 필요합니다."}), 400
-
-        try:
-            user_id = int(user_id)
-        except ValueError:
-            return jsonify({"error": "유효하지 않은 사용자 ID 형식입니다. 숫자를 기대합니다."}), 400
-
-        user = User.query.get(user_id)
-        if not user:
-            return jsonify({"error": f"사용자 ID {user_id}에 해당하는 사용자를 찾을 수 없습니다."}), 404
 
         # Base64 이미지 데이터 유효성 검증
         if not image_data.startswith('data:image/'):
@@ -1273,20 +1279,23 @@ def save_drawing():
         return jsonify({"error": f"서버 오류: {str(e)}"}), 500
 
 @app.route('/api/drawings/<int:drawing_id>', methods=['PUT'])
+@token_required
 def update_drawing(drawing_id):
     """기존 그림을 업데이트하는 API"""
     try:
         data = request.get_json()
+        user_info = request.current_user  # JWT 토큰에서 사용자 정보 가져오기
+        user_id = user_info['user_id']
         image_data = data.get('image')
         analysis_result = data.get('analysis_result')
 
         if not image_data:
             return jsonify({"error": "이미지 데이터가 필요합니다."}), 400
 
-        # 기존 그림 찾기
-        drawing = Drawing.query.get(drawing_id)
+        # 기존 그림 찾기 (사용자 소유인지 확인)
+        drawing = Drawing.query.filter_by(id=drawing_id, user_id=user_id).first()
         if not drawing:
-            return jsonify({"error": "그림을 찾을 수 없습니다."}), 404
+            return jsonify({"error": "그림을 찾을 수 없거나 접근 권한이 없습니다."}), 404
 
         # Base64 이미지 데이터 유효성 검증
         if not image_data.startswith('data:image/'):
@@ -1310,13 +1319,13 @@ def update_drawing(drawing_id):
         print(f"그림 업데이트 API 오류: {e}")
         return jsonify({"error": f"서버 오류: {str(e)}"}), 500
 
-@app.route('/api/drawings/<int:user_id>', methods=['GET'])
-def get_user_drawings(user_id):
-    """특정 사용자의 그림 및 분석 결과를 가져오는 API"""
+@app.route('/api/drawings', methods=['GET'])
+@token_required
+def get_user_drawings():
+    """현재 로그인한 사용자의 그림 및 분석 결과를 가져오는 API"""
     try:
-        user = User.query.get(user_id)
-        if not user:
-            return jsonify({"error": "유효하지 않은 사용자 ID입니다."}), 404
+        user_info = request.current_user  # JWT 토큰에서 사용자 정보 가져오기
+        user_id = user_info['user_id']
 
         drawings = Drawing.query.filter_by(user_id=user_id).order_by(Drawing.created_at.desc()).all()
         
@@ -1472,6 +1481,150 @@ def verify_token():
         }), 200
     except Exception as e:
         print(f"토큰 검증 API 오류: {e}")
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
+@app.route('/api/drawings/<int:drawing_id>', methods=['DELETE'])
+@token_required
+def delete_drawing(drawing_id):
+    """그림 삭제 API"""
+    try:
+        user_info = request.current_user  # JWT 토큰에서 사용자 정보 가져오기
+        user_id = user_info['user_id']
+
+        # 기존 그림 찾기 (사용자 소유인지 확인)
+        drawing = Drawing.query.filter_by(id=drawing_id, user_id=user_id).first()
+        if not drawing:
+            return jsonify({"error": "그림을 찾을 수 없거나 접근 권한이 없습니다."}), 404
+
+        db.session.delete(drawing)
+        db.session.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "그림이 성공적으로 삭제되었습니다."
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"그림 삭제 API 오류: {e}")
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
+# 감정일기 관련 API 엔드포인트들
+
+@app.route('/api/emotion-diary', methods=['POST'])
+@token_required
+def create_emotion_diary():
+    """감정일기 작성"""
+    try:
+        data = request.get_json()
+        user_info = request.current_user
+        
+        # 필수 필드 검증
+        if not data or not data.get('emotion') or not data.get('emotion_id') or not data.get('content'):
+            return jsonify({"error": "감정과 일기 내용을 모두 입력해주세요."}), 400
+        
+        # 감정일기 생성
+        diary = EmotionDiary(
+            user_id=user_info['user_id'],
+            emotion=data['emotion'],
+            emotion_id=data['emotion_id'],
+            content=data['content']
+        )
+        
+        db.session.add(diary)
+        db.session.commit()
+        
+        return jsonify({
+            "success": True,
+            "message": "감정일기가 저장되었습니다.",
+            "diary_id": diary.id
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"감정일기 저장 오류: {e}")
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
+@app.route('/api/emotion-diary', methods=['GET'])
+@token_required
+def get_emotion_diaries():
+    """사용자의 감정일기 목록 조회"""
+    try:
+        user_info = request.current_user
+        
+        # 사용자의 모든 감정일기 조회 (최신순)
+        diaries = EmotionDiary.query.filter_by(user_id=user_info['user_id'])\
+            .order_by(EmotionDiary.created_at.desc()).all()
+        
+        diary_list = []
+        for diary in diaries:
+            diary_list.append({
+                "id": diary.id,
+                "emotion": diary.emotion,
+                "emotion_id": diary.emotion_id,
+                "content": diary.content,
+                "created_at": diary.created_at.isoformat()
+            })
+        
+        return jsonify({
+            "success": True,
+            "diaries": diary_list
+        }), 200
+        
+    except Exception as e:
+        print(f"감정일기 조회 오류: {e}")
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
+@app.route('/api/emotion-diary/<int:diary_id>', methods=['GET'])
+@token_required
+def get_emotion_diary(diary_id):
+    """특정 감정일기 조회"""
+    try:
+        user_info = request.current_user
+        
+        diary = EmotionDiary.query.filter_by(id=diary_id, user_id=user_info['user_id']).first()
+        
+        if not diary:
+            return jsonify({"error": "감정일기를 찾을 수 없습니다."}), 404
+        
+        return jsonify({
+            "success": True,
+            "diary": {
+                "id": diary.id,
+                "emotion": diary.emotion,
+                "emotion_id": diary.emotion_id,
+                "content": diary.content,
+                "created_at": diary.created_at.isoformat()
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"감정일기 조회 오류: {e}")
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
+@app.route('/api/emotion-diary/<int:diary_id>', methods=['DELETE'])
+@token_required
+def delete_emotion_diary(diary_id):
+    """감정일기 삭제"""
+    try:
+        user_info = request.current_user
+        
+        diary = EmotionDiary.query.filter_by(id=diary_id, user_id=user_info['user_id']).first()
+        
+        if not diary:
+            return jsonify({"error": "감정일기를 찾을 수 없습니다."}), 404
+        
+        db.session.delete(diary)
+        db.session.commit()
+        
+        return jsonify({
+            "success": True,
+            "message": "감정일기가 삭제되었습니다."
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"감정일기 삭제 오류: {e}")
         return jsonify({"error": f"서버 오류: {str(e)}"}), 500
 
 if __name__ == '__main__':
