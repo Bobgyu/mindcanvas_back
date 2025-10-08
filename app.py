@@ -177,6 +177,7 @@ class Drawing(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     image_data = db.Column(db.Text, nullable=False)  # Base64 이미지 데이터를 직접 저장
     analysis_result = db.Column(db.JSON, nullable=True) # JSON 타입으로 분석 결과 저장
+    drawing_type = db.Column(db.String(50), nullable=True, default='normal')  # 그림 타입 (normal, theme, colored)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     updated_at = db.Column(db.DateTime, default=db.func.current_timestamp(), onupdate=db.func.current_timestamp())
 
@@ -1279,11 +1280,13 @@ def save_drawing():
         user_id = user_info['user_id']
         image_data = data.get('image') # Base64 이미지 데이터
         analysis_result = data.get('analysis_result')
+        drawing_type = data.get('drawing_type', 'normal')  # drawing_type 추가
 
         # 디버깅: 수신된 데이터 로깅
         print(f"[save_drawing] 인증된 user_id: {user_id}")
         print(f"[save_drawing] image_data 길이: {len(image_data) if image_data else 'None'}")
         print(f"[save_drawing] analysis_result 존재 여부: {analysis_result is not None}")
+        print(f"[save_drawing] drawing_type: {drawing_type}")
 
         if not image_data:
             return jsonify({"error": "이미지 데이터가 필요합니다."}), 400
@@ -1296,7 +1299,8 @@ def save_drawing():
         new_drawing = Drawing(
             user_id=user_id,
             image_data=image_data,  # Base64 데이터를 직접 저장
-            analysis_result=analysis_result
+            analysis_result=analysis_result,
+            drawing_type=drawing_type  # drawing_type 추가
         )
         db.session.add(new_drawing)
         db.session.commit()
@@ -1700,14 +1704,20 @@ def save_colored_drawing():
         user_id = user_info['user_id']
         
         image_data = data.get('image')
+        drawing_type = data.get('drawing_type', 'colored')  # 색칠하기는 기본값을 'colored'로
+        
+        # 디버깅: 수신된 데이터 로깅
+        print(f"[save_colored_drawing] user_id: {user_id}")
+        print(f"[save_colored_drawing] drawing_type: {drawing_type}")
         
         if not image_data:
             return jsonify({"error": "이미지 데이터가 누락되었습니다."}), 400
         
-        # 색칠 그림 저장 (기존 컬럼만 사용)
+        # 색칠 그림 저장 (drawing_type 포함)
         colored_drawing = Drawing(
             user_id=user_id,
-            image_data=image_data
+            image_data=image_data,
+            drawing_type=drawing_type
         )
         
         db.session.add(colored_drawing)
