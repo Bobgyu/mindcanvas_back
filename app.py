@@ -68,6 +68,7 @@ class User(db.Model):
     username = db.Column(db.String(80), nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=True)
+    is_admin = db.Column(db.Boolean, nullable=False, default=False)
 
     def __repr__(self):
         return f'<User {self.username}>'
@@ -128,6 +129,39 @@ def token_required(f):
             payload = verify_jwt_token(token)
             if payload is None:
                 return jsonify({"error": "유효하지 않은 토큰입니다."}), 401
+            
+            # request 객체에 사용자 정보 추가
+            request.current_user = payload
+        except Exception as e:
+            return jsonify({"error": f"토큰 검증 오류: {str(e)}"}), 401
+        
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_required(f):
+    """관리자 권한 검증 데코레이터"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]  # "Bearer <token>" 형식에서 토큰 추출
+            except IndexError:
+                return jsonify({"error": "토큰 형식이 올바르지 않습니다."}), 401
+        
+        if not token:
+            return jsonify({"error": "토큰이 필요합니다."}), 401
+        
+        try:
+            payload = verify_jwt_token(token)
+            if payload is None:
+                return jsonify({"error": "유효하지 않은 토큰입니다."}), 401
+            
+            # 사용자 정보 조회
+            user = User.query.filter_by(id=payload['user_id']).first()
+            if not user or not user.is_admin:
+                return jsonify({"error": "관리자 권한이 필요합니다."}), 403
             
             # request 객체에 사용자 정보 추가
             request.current_user = payload
@@ -1431,7 +1465,10 @@ def login():
         if not username or not password:
             return jsonify({"error": "사용자 이름과 비밀번호가 필요합니다."}), 400
 
+        # 사용자명 또는 이메일로 로그인 가능하도록 수정
         user = User.query.filter_by(username=username).first()
+        if not user:
+            user = User.query.filter_by(email=username).first()
 
         if user and check_password_hash(user.password_hash, password):
             # JWT 토큰 생성
@@ -1464,6 +1501,32 @@ def logout():
         }), 200
     except Exception as e:
         print(f"로그아웃 API 오류: {e}")
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
+@app.route('/api/user-info', methods=['GET', 'OPTIONS'])
+@cross_origin()
+@token_required
+def get_user_info():
+    """사용자 정보 조회 API"""
+    try:
+        user_id = request.current_user['user_id']
+        user = User.query.filter_by(id=user_id).first()
+        
+        if not user:
+            return jsonify({"error": "사용자를 찾을 수 없습니다."}), 404
+        
+        return jsonify({
+            "success": True,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "is_admin": user.is_admin
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"사용자 정보 조회 오류: {e}")
         return jsonify({"error": f"서버 오류: {str(e)}"}), 500
 
 @app.route('/api/verify-token', methods=['POST', 'OPTIONS'])
@@ -1627,8 +1690,165 @@ def delete_emotion_diary(diary_id):
         print(f"감정일기 삭제 오류: {e}")
         return jsonify({"error": f"서버 오류: {str(e)}"}), 500
 
+@app.route('/api/colored-drawings', methods=['POST'])
+@token_required
+def save_colored_drawing():
+    """색칠한 그림을 저장하는 API"""
+    try:
+        data = request.get_json()
+        user_info = request.current_user
+        user_id = user_info['user_id']
+        
+        image_data = data.get('image')
+        
+        if not image_data:
+            return jsonify({"error": "이미지 데이터가 누락되었습니다."}), 400
+        
+        # 색칠 그림 저장 (기존 컬럼만 사용)
+        colored_drawing = Drawing(
+            user_id=user_id,
+            image_data=image_data
+        )
+        
+        db.session.add(colored_drawing)
+        db.session.commit()
+        
+        return jsonify({
+            "success": True,
+            "message": "색칠한 그림이 저장되었습니다.",
+            "drawing_id": colored_drawing.id
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"색칠 그림 저장 오류: {e}")
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
 if __name__ == '__main__':
     print("=" * 60)
+# 관리자용 API 엔드포인트
+@app.route('/api/admin/users', methods=['GET'])
+@admin_required
+def get_all_users():
+    """모든 사용자 목록 조회 (관리자만)"""
+    try:
+        users = User.query.all()
+        user_list = []
+        for user in users:
+            user_list.append({
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'is_admin': user.is_admin
+            })
+        
+        return jsonify({
+            'success': True,
+            'users': user_list,
+            'total': len(user_list)
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'사용자 목록 조회 실패: {str(e)}'
+        }), 500
+
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+@admin_required
+def delete_user(user_id):
+    """사용자 삭제 (관리자만)"""
+    try:
+        user = User.query.filter_by(id=user_id).first()
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': '사용자를 찾을 수 없습니다.'
+            }), 404
+        
+        # 관리자 계정은 삭제할 수 없음
+        if user.is_admin:
+            return jsonify({
+                'success': False,
+                'error': '관리자 계정은 삭제할 수 없습니다.'
+            }), 400
+        
+        db.session.delete(user)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'사용자 {user.username}이 삭제되었습니다.'
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': f'사용자 삭제 실패: {str(e)}'
+        }), 500
+
+@app.route('/api/admin/users/<int:user_id>/admin', methods=['POST'])
+@admin_required
+def toggle_admin_status(user_id):
+    """사용자 관리자 권한 토글 (관리자만)"""
+    try:
+        user = User.query.filter_by(id=user_id).first()
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': '사용자를 찾을 수 없습니다.'
+            }), 404
+        
+        # 현재 요청한 사용자는 자신의 권한을 변경할 수 없음
+        current_user_id = request.current_user['user_id']
+        if user.id == current_user_id:
+            return jsonify({
+                'success': False,
+                'error': '자신의 관리자 권한은 변경할 수 없습니다.'
+            }), 400
+        
+        user.is_admin = not user.is_admin
+        db.session.commit()
+        
+        status = "관리자" if user.is_admin else "일반 사용자"
+        return jsonify({
+            'success': True,
+            'message': f'사용자 {user.username}의 권한이 {status}로 변경되었습니다.',
+            'is_admin': user.is_admin
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': f'권한 변경 실패: {str(e)}'
+        }), 500
+
+@app.route('/api/admin/stats', methods=['GET'])
+@admin_required
+def get_admin_stats():
+    """관리자 통계 정보"""
+    try:
+        total_users = User.query.count()
+        admin_users = User.query.filter_by(is_admin=True).count()
+        total_drawings = Drawing.query.count()
+        total_diaries = EmotionDiary.query.count()
+        
+        return jsonify({
+            'success': True,
+            'stats': {
+                'total_users': total_users,
+                'admin_users': admin_users,
+                'regular_users': total_users - admin_users,
+                'total_drawings': total_drawings,
+                'total_diaries': total_diaries
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'통계 조회 실패: {str(e)}'
+        }), 500
+
+if __name__ == '__main__':
     print("MindCanvas Backend 서버를 시작합니다...")
     print("=" * 60)
     print(f"로드된 YOLOv5 모델: {list(yolo_analyzer.models.keys())}")
