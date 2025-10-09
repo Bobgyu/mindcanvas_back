@@ -186,6 +186,21 @@ class Drawing(db.Model):
     def __repr__(self):
         return f'<Drawing {self.id} by User {self.user_id}>'
 
+class Chat(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    coordinator_id = db.Column(db.Integer, nullable=False)  # 코디네이터 ID
+    coordinator_name = db.Column(db.String(100), nullable=False)  # 코디네이터 이름
+    message = db.Column(db.Text, nullable=False)  # 메시지 내용
+    sender = db.Column(db.String(20), nullable=False)  # 'user' 또는 'coordinator'
+    is_read = db.Column(db.Boolean, default=False, nullable=False)  # 읽음 상태
+    created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+
+    user = db.relationship('User', backref=db.backref('chats', lazy=True))
+
+    def __repr__(self):
+        return f'<Chat {self.id} from {self.sender}>'
+
 # 업로드 및 출력 폴더 생성
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
@@ -1287,6 +1302,10 @@ def save_drawing():
         print(f"[save_drawing] image_data 길이: {len(image_data) if image_data else 'None'}")
         print(f"[save_drawing] analysis_result 존재 여부: {analysis_result is not None}")
         print(f"[save_drawing] drawing_type: {drawing_type}")
+        if analysis_result:
+            print(f"[save_drawing] analysis_result 필드들: {list(analysis_result.keys()) if isinstance(analysis_result, dict) else 'Not a dict'}")
+            if isinstance(analysis_result, dict) and 'ai_analysis' in analysis_result:
+                print(f"[save_drawing] ai_analysis 길이: {len(str(analysis_result['ai_analysis'])) if analysis_result['ai_analysis'] else 'None'}")
 
         if not image_data:
             return jsonify({"error": "이미지 데이터가 필요합니다."}), 400
@@ -1327,20 +1346,28 @@ def update_drawing(drawing_id):
         image_data = data.get('image')
         analysis_result = data.get('analysis_result')
 
-        if not image_data:
-            return jsonify({"error": "이미지 데이터가 필요합니다."}), 400
+        # 디버깅: 업데이트 데이터 로깅
+        print(f"[update_drawing] drawing_id: {drawing_id}")
+        print(f"[update_drawing] user_id: {user_id}")
+        print(f"[update_drawing] analysis_result 존재 여부: {analysis_result is not None}")
+        if analysis_result:
+            print(f"[update_drawing] analysis_result 필드들: {list(analysis_result.keys()) if isinstance(analysis_result, dict) else 'Not a dict'}")
+            if isinstance(analysis_result, dict) and 'ai_analysis' in analysis_result:
+                print(f"[update_drawing] ai_analysis 길이: {len(str(analysis_result['ai_analysis'])) if analysis_result['ai_analysis'] else 'None'}")
 
         # 기존 그림 찾기 (사용자 소유인지 확인)
         drawing = Drawing.query.filter_by(id=drawing_id, user_id=user_id).first()
         if not drawing:
             return jsonify({"error": "그림을 찾을 수 없거나 접근 권한이 없습니다."}), 404
 
-        # Base64 이미지 데이터 유효성 검증
-        if not image_data.startswith('data:image/'):
-            return jsonify({"error": "유효한 Base64 이미지 데이터 형식이 아닙니다."}), 400
+        # 이미지 데이터가 있으면 업데이트
+        if image_data:
+            # Base64 이미지 데이터 유효성 검증
+            if not image_data.startswith('data:image/'):
+                return jsonify({"error": "유효한 Base64 이미지 데이터 형식이 아닙니다."}), 400
+            drawing.image_data = image_data  # Base64 데이터를 직접 저장
 
-        # 그림 업데이트 (데이터베이스에 직접 저장)
-        drawing.image_data = image_data  # Base64 데이터를 직접 저장
+        # 분석 결과가 있으면 업데이트
         if analysis_result:
             drawing.analysis_result = analysis_result
 
@@ -1376,6 +1403,7 @@ def get_user_drawings():
                         "id": drawing.id,
                         "image": drawing.image_data,  # 이미 Base64 형식으로 저장됨
                         "analysis_result": drawing.analysis_result,
+                        "drawing_type": drawing.drawing_type,  # drawing_type 추가
                         "created_at": drawing.created_at.isoformat(),
                         "updated_at": drawing.updated_at.isoformat()
                     })
@@ -1856,6 +1884,173 @@ def get_admin_stats():
         return jsonify({
             'success': False,
             'error': f'통계 조회 실패: {str(e)}'
+        }), 500
+
+# 채팅 메시지 저장 API
+@app.route('/api/chat/send', methods=['POST'])
+def send_chat_message():
+    try:
+        data = request.get_json()
+        # 임시로 user_id를 1로 설정 (테스트용)
+        user_id = 1
+        
+        coordinator_id = data.get('coordinator_id')
+        coordinator_name = data.get('coordinator_name')
+        message = data.get('message')
+        sender = data.get('sender', 'user')  # 'user' 또는 'coordinator'
+        
+        if not all([coordinator_id, coordinator_name, message]):
+            return jsonify({'success': False, 'error': '필수 필드가 누락되었습니다.'}), 400
+        
+        # 채팅 메시지 저장
+        chat = Chat(
+            user_id=user_id,
+            coordinator_id=coordinator_id,
+            coordinator_name=coordinator_name,
+            message=message,
+            sender=sender
+        )
+        
+        db.session.add(chat)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': '메시지가 저장되었습니다.',
+            'chat_id': chat.id
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': f'메시지 저장 실패: {str(e)}'
+        }), 500
+
+# 채팅 히스토리 조회 API
+@app.route('/api/chat/history', methods=['GET'])
+def get_chat_history():
+    try:
+        # 임시로 user_id를 1로 설정 (테스트용)
+        user_id = 1
+        coordinator_id = request.args.get('coordinator_id')
+        
+        if not coordinator_id:
+            return jsonify({'success': False, 'error': '코디네이터 ID가 필요합니다.'}), 400
+        
+        # 해당 코디네이터와의 채팅 히스토리 조회
+        chats = Chat.query.filter_by(
+            user_id=user_id,
+            coordinator_id=coordinator_id
+        ).order_by(Chat.created_at.asc()).all()
+        
+        chat_history = []
+        for chat in chats:
+            chat_history.append({
+                'id': chat.id,
+                'message': chat.message,
+                'sender': chat.sender,
+                'created_at': chat.created_at.isoformat()
+            })
+        
+        return jsonify({
+            'success': True,
+            'chats': chat_history
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'채팅 히스토리 조회 실패: {str(e)}'
+        }), 500
+
+# 채팅방 목록 조회 API
+@app.route('/api/chat/rooms', methods=['GET'])
+def get_chat_rooms():
+    try:
+        # 임시로 user_id를 1로 설정 (테스트용)
+        user_id = 1
+        
+        # 사용자의 모든 채팅 메시지 조회
+        all_chats = Chat.query.filter_by(user_id=user_id).order_by(Chat.created_at.desc()).all()
+        
+        # 코디네이터별로 그룹화
+        coordinator_rooms = {}
+        for chat in all_chats:
+            coordinator_id = chat.coordinator_id
+            if coordinator_id not in coordinator_rooms:
+                coordinator_rooms[coordinator_id] = {
+                    'coordinator_id': coordinator_id,
+                    'coordinator_name': chat.coordinator_name,
+                    'last_message': chat.message,
+                    'last_message_time': chat.created_at,
+                    'unread_count': 0
+                }
+        
+        # 읽지 않은 메시지 개수 계산
+        for coordinator_id in coordinator_rooms:
+            unread_count = Chat.query.filter_by(
+                user_id=user_id,
+                coordinator_id=coordinator_id,
+                sender='coordinator',
+                is_read=False
+            ).count()
+            coordinator_rooms[coordinator_id]['unread_count'] = unread_count
+        
+        # 리스트로 변환
+        rooms_data = list(coordinator_rooms.values())
+        
+        # 시간순으로 정렬
+        rooms_data.sort(key=lambda x: x['last_message_time'], reverse=True)
+        
+        # 시간을 ISO 형식으로 변환
+        for room in rooms_data:
+            room['last_message_time'] = room['last_message_time'].isoformat()
+        
+        return jsonify({
+            'success': True,
+            'chat_rooms': rooms_data
+        })
+        
+    except Exception as e:
+        print(f"채팅방 목록 조회 오류: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'채팅방 목록 조회 실패: {str(e)}'
+        }), 500
+
+# 메시지 읽음 상태 업데이트 API
+@app.route('/api/chat/mark-read', methods=['POST'])
+@token_required
+def mark_messages_read():
+    try:
+        user_info = request.current_user
+        user_id = user_info['user_id']
+        data = request.get_json()
+        coordinator_id = data.get('coordinator_id')
+        
+        if not coordinator_id:
+            return jsonify({'success': False, 'error': '코디네이터 ID가 필요합니다.'}), 400
+        
+        # 해당 코디네이터의 모든 읽지 않은 메시지를 읽음 상태로 업데이트
+        Chat.query.filter_by(
+            user_id=user_id,
+            coordinator_id=coordinator_id,
+            sender='coordinator',
+            is_read=False
+        ).update({'is_read': True})
+        
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': '메시지가 읽음 상태로 업데이트되었습니다.'
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'메시지 읽음 상태 업데이트 실패: {str(e)}'
         }), 500
 
 if __name__ == '__main__':
