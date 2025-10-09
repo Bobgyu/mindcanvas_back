@@ -1888,11 +1888,12 @@ def get_admin_stats():
 
 # 채팅 메시지 저장 API
 @app.route('/api/chat/send', methods=['POST'])
+@token_required
 def send_chat_message():
     try:
+        user_info = request.current_user
+        user_id = user_info['user_id']
         data = request.get_json()
-        # 임시로 user_id를 1로 설정 (테스트용)
-        user_id = 1
         
         coordinator_id = data.get('coordinator_id')
         coordinator_name = data.get('coordinator_name')
@@ -1929,10 +1930,11 @@ def send_chat_message():
 
 # 채팅 히스토리 조회 API
 @app.route('/api/chat/history', methods=['GET'])
+@token_required
 def get_chat_history():
     try:
-        # 임시로 user_id를 1로 설정 (테스트용)
-        user_id = 1
+        user_info = request.current_user
+        user_id = user_info['user_id']
         coordinator_id = request.args.get('coordinator_id')
         
         if not coordinator_id:
@@ -1966,10 +1968,11 @@ def get_chat_history():
 
 # 채팅방 목록 조회 API
 @app.route('/api/chat/rooms', methods=['GET'])
+@token_required
 def get_chat_rooms():
     try:
-        # 임시로 user_id를 1로 설정 (테스트용)
-        user_id = 1
+        user_info = request.current_user
+        user_id = user_info['user_id']
         
         # 사용자의 모든 채팅 메시지 조회
         all_chats = Chat.query.filter_by(user_id=user_id).order_by(Chat.created_at.desc()).all()
@@ -2051,6 +2054,106 @@ def mark_messages_read():
         return jsonify({
             'success': False,
             'error': f'메시지 읽음 상태 업데이트 실패: {str(e)}'
+        }), 500
+
+# 사용자의 지정된 코디네이터 정보 조회 API
+@app.route('/api/user/coordinator', methods=['GET'])
+@token_required
+def get_user_coordinator():
+    """사용자의 지정된 코디네이터 정보를 가져오는 API"""
+    try:
+        user_info = request.current_user
+        user_id = user_info['user_id']
+        
+        # 사용자가 채팅한 코디네이터 중 가장 최근에 채팅한 코디네이터를 찾기
+        latest_chat = Chat.query.filter_by(user_id=user_id).order_by(Chat.created_at.desc()).first()
+        
+        if not latest_chat:
+            return jsonify({
+                'success': True,
+                'coordinator': None,
+                'message': '아직 지정된 코디네이터가 없습니다.'
+            })
+        
+        # 연결 끊기 메시지가 있는지 확인
+        disconnect_message = Chat.query.filter_by(
+            user_id=user_id,
+            coordinator_id=latest_chat.coordinator_id,
+            sender='system',
+            message='[연결이 끊어졌습니다]'
+        ).first()
+        
+        # 연결 끊기 메시지가 있고, 그것이 가장 최근 메시지인 경우
+        if disconnect_message and disconnect_message.created_at >= latest_chat.created_at:
+            return jsonify({
+                'success': True,
+                'coordinator': None,
+                'message': '코디네이터와의 연결이 끊어졌습니다.'
+            })
+        
+        # 코디네이터 정보 구성
+        coordinator_info = {
+            'id': latest_chat.coordinator_id,
+            'name': latest_chat.coordinator_name,
+            'institution': '마음치료센터',  # 기본값
+            'age': '65세',  # 김상담의 나이
+            'region': '서울',  # 김상담의 지역
+            'experience': '8년',  # 김상담의 경력
+            'profile': '/src/imgdata/icon/user.png'
+        }
+        
+        return jsonify({
+            'success': True,
+            'coordinator': coordinator_info,
+            'message': '사용자의 지정된 코디네이터 정보를 성공적으로 가져왔습니다.'
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'코디네이터 정보 조회 실패: {str(e)}'
+        }), 500
+
+@app.route('/api/user/coordinator/disconnect', methods=['POST'])
+@token_required
+def disconnect_coordinator():
+    """사용자의 코디네이터 연결을 끊는 API (채팅 기록은 유지)"""
+    try:
+        user_info = request.current_user
+        user_id = user_info['user_id']
+        data = request.get_json()
+        coordinator_id = data.get('coordinator_id')
+        
+        if not coordinator_id:
+            return jsonify({
+                'success': False,
+                'error': '코디네이터 ID가 필요합니다.'
+            }), 400
+        
+        # 연결 끊기 표시를 위한 특별한 메시지를 채팅에 추가
+        disconnect_message = Chat(
+            user_id=user_id,
+            coordinator_id=coordinator_id,
+            coordinator_name="시스템",
+            message="[연결이 끊어졌습니다]",
+            sender='system',
+            is_read=True
+        )
+        
+        db.session.add(disconnect_message)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': '코디네이터와의 연결이 끊어졌습니다. 채팅 기록은 보존됩니다.',
+            'coordinator_id': coordinator_id
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': f'코디네이터 연결 끊기 실패: {str(e)}'
         }), 500
 
 if __name__ == '__main__':
