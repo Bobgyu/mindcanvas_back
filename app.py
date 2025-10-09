@@ -2156,6 +2156,37 @@ def disconnect_coordinator():
             'error': f'코디네이터 연결 끊기 실패: {str(e)}'
         }), 500
 
+# 채팅방 삭제 API
+@app.route('/api/chat/room/<int:coordinator_id>', methods=['DELETE'])
+@token_required
+def delete_chat_room(coordinator_id):
+    """특정 코디네이터와의 채팅방을 삭제하는 API"""
+    try:
+        user_info = request.current_user
+        user_id = user_info['user_id']
+        
+        # 해당 코디네이터와의 모든 채팅 메시지 삭제
+        deleted_count = Chat.query.filter_by(
+            user_id=user_id,
+            coordinator_id=coordinator_id
+        ).delete()
+        
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'채팅방이 삭제되었습니다. ({deleted_count}개의 메시지가 삭제됨)',
+            'deleted_messages': deleted_count
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"채팅방 삭제 오류: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'채팅방 삭제 실패: {str(e)}'
+        }), 500
+
 if __name__ == '__main__':
     print("MindCanvas Backend 서버를 시작합니다...")
     print("=" * 60)
