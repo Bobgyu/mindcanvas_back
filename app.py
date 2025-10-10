@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS, cross_origin # cross_origin 임포트 추가
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.utils import secure_filename
 import torch
 from PIL import Image
@@ -47,6 +48,7 @@ NAVER_SEARCH_CLIENT_SECRET = os.getenv('NAVER_SEARCH_CLIENT_SECRET')
 app = Flask(__name__)
 
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logger=True, engineio_logger=True)
 
 # PostgreSQL 설정
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:codelab0080**A@34.64.71.12:5432/postgres?options=-csearch_path%3Djuyeoung') + '&client_encoding=UTF8'
@@ -68,7 +70,13 @@ class User(db.Model):
     username = db.Column(db.String(80), nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=True)
+    name = db.Column(db.String(100), nullable=True)  # 사용자 이름
+    profile_image = db.Column(db.String(500), nullable=True)  # 프로필 이미지 경로
     is_admin = db.Column(db.Boolean, nullable=False, default=False)
+    user_type = db.Column(db.String(20), nullable=False, default='user')  # 'user' 또는 'coordinator'
+    coordinator_id = db.Column(db.Integer, nullable=True)  # 코디네이터 전용 ID
+    specialization = db.Column(db.String(100), nullable=True)  # 전문 분야
+    is_available = db.Column(db.Boolean, nullable=False, default=True)  # 상담 가능 상태
 
     def __repr__(self):
         return f'<User {self.username}>'
@@ -191,6 +199,7 @@ class Chat(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     coordinator_id = db.Column(db.Integer, nullable=False)  # 코디네이터 ID
     coordinator_name = db.Column(db.String(100), nullable=False)  # 코디네이터 이름
+    coordinator_profile = db.Column(db.String(500), nullable=True)  # 코디네이터 프로필 이미지
     message = db.Column(db.Text, nullable=False)  # 메시지 내용
     sender = db.Column(db.String(20), nullable=False)  # 'user' 또는 'coordinator'
     is_read = db.Column(db.Boolean, default=False, nullable=False)  # 읽음 상태
@@ -1897,6 +1906,7 @@ def send_chat_message():
         
         coordinator_id = data.get('coordinator_id')
         coordinator_name = data.get('coordinator_name')
+        coordinator_profile = data.get('coordinator_profile', '/src/imgdata/icon/user.png')  # 프로필 이미지 추가
         message = data.get('message')
         sender = data.get('sender', 'user')  # 'user' 또는 'coordinator'
         
@@ -1904,13 +1914,19 @@ def send_chat_message():
             return jsonify({'success': False, 'error': '필수 필드가 누락되었습니다.'}), 400
         
         # 채팅 메시지 저장
-        chat = Chat(
-            user_id=user_id,
-            coordinator_id=coordinator_id,
-            coordinator_name=coordinator_name,
-            message=message,
-            sender=sender
-        )
+        chat_data = {
+            'user_id': user_id,
+            'coordinator_id': coordinator_id,
+            'coordinator_name': coordinator_name,
+            'message': message,
+            'sender': sender
+        }
+        
+        # coordinator_profile 필드가 존재하는 경우에만 추가
+        if coordinator_profile:
+            chat_data['coordinator_profile'] = coordinator_profile
+            
+        chat = Chat(**chat_data)
         
         db.session.add(chat)
         db.session.commit()
@@ -1934,11 +1950,14 @@ def send_chat_message():
 def get_chat_history():
     try:
         user_info = request.current_user
-        user_id = user_info['user_id']
+        user_id = request.args.get('user_id')  # URL 파라미터에서 user_id 가져오기
         coordinator_id = request.args.get('coordinator_id')
         
         if not coordinator_id:
             return jsonify({'success': False, 'error': '코디네이터 ID가 필요합니다.'}), 400
+        
+        if not user_id:
+            return jsonify({'success': False, 'error': '사용자 ID가 필요합니다.'}), 400
         
         # 해당 코디네이터와의 채팅 히스토리 조회
         chats = Chat.query.filter_by(
@@ -1982,9 +2001,24 @@ def get_chat_rooms():
         for chat in all_chats:
             coordinator_id = chat.coordinator_id
             if coordinator_id not in coordinator_rooms:
+                # 실제 코디네이터 정보를 DB에서 조회
+                coordinator = User.query.filter_by(
+                    coordinator_id=coordinator_id,
+                    user_type='coordinator'
+                ).first()
+                
+                # 실제 코디네이터 이름과 프로필 이미지 사용
+                if coordinator:
+                    coordinator_name = coordinator.name or coordinator.username or '코디네이터'
+                    profile_image = coordinator.profile_image or f"/src/imgdata/icon/마음코디네이터{coordinator_id}.png"
+                else:
+                    coordinator_name = chat.coordinator_name or '코디네이터'
+                    profile_image = getattr(chat, 'coordinator_profile', None) or '/src/imgdata/icon/user.png'
+                
                 coordinator_rooms[coordinator_id] = {
                     'coordinator_id': coordinator_id,
-                    'coordinator_name': chat.coordinator_name,
+                    'coordinator_name': coordinator_name,  # 실제 DB에서 조회한 이름
+                    'coordinator_profile': profile_image,  # 실제 DB에서 조회한 프로필 이미지
                     'last_message': chat.message,
                     'last_message_time': chat.created_at,
                     'unread_count': 0
@@ -2091,16 +2125,37 @@ def get_user_coordinator():
                 'message': '코디네이터와의 연결이 끊어졌습니다.'
             })
         
-        # 코디네이터 정보 구성
-        coordinator_info = {
-            'id': latest_chat.coordinator_id,
-            'name': latest_chat.coordinator_name,
-            'institution': '마음치료센터',  # 기본값
-            'age': '65세',  # 김상담의 나이
-            'region': '서울',  # 김상담의 지역
-            'experience': '8년',  # 김상담의 경력
-            'profile': '/src/imgdata/icon/user.png'
-        }
+        # DB에서 실제 코디네이터 정보 가져오기
+        coordinator = User.query.filter_by(
+            coordinator_id=latest_chat.coordinator_id,
+            user_type='coordinator'
+        ).first()
+        
+        if coordinator:
+            # 디버깅 로그 추가
+            print(f"코디네이터 정보 - ID: {coordinator.coordinator_id}, name: {coordinator.name}, username: {coordinator.username}")
+            
+            # DB에서 가져온 실제 정보 사용
+            coordinator_info = {
+                'id': coordinator.coordinator_id,
+                'name': coordinator.name or coordinator.username or '알 수 없음',
+                'institution': '심리상담센터',  # 기본값 (필요시 DB에 추가 필드 생성)
+                'age': '65세',  # 기본값 (필요시 DB에 추가 필드 생성)
+                'region': '인천',  # 기본값 (필요시 DB에 추가 필드 생성)
+                'experience': '8년',  # 기본값 (필요시 DB에 추가 필드 생성)
+                'profile': coordinator.profile_image or f"/src/imgdata/icon/마음코디네이터{coordinator.coordinator_id}.png"
+            }
+        else:
+            # 코디네이터를 찾을 수 없는 경우 기본 정보 사용
+            coordinator_info = {
+                'id': latest_chat.coordinator_id,
+                'name': latest_chat.coordinator_name,
+                'institution': '심리상담센터',
+                'age': '65세',
+                'region': '인천',
+                'experience': '8년',
+                'profile': f"/src/imgdata/icon/마음코디네이터{latest_chat.coordinator_id}.png"
+            }
         
         return jsonify({
             'success': True,
@@ -2187,11 +2242,333 @@ def delete_chat_room(coordinator_id):
             'error': f'채팅방 삭제 실패: {str(e)}'
         }), 500
 
+# WebSocket 이벤트 핸들러
+@socketio.on('connect')
+def handle_connect():
+    print('클라이언트가 연결되었습니다.')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('클라이언트가 연결을 끊었습니다.')
+
+@socketio.on('join_chat')
+def handle_join_chat(data):
+    """채팅방 입장"""
+    try:
+        user_id = data.get('user_id')
+        coordinator_id = data.get('coordinator_id')
+        user_type = data.get('user_type')  # 'user' 또는 'coordinator'
+        
+        if not all([user_id, coordinator_id, user_type]):
+            emit('error', {'message': '필수 정보가 누락되었습니다.'})
+            return
+        
+        # 채팅방 ID 생성 (양방향 통신을 위해)
+        room_id = f"chat_{user_id}_{coordinator_id}"
+        join_room(room_id)
+        
+        print(f'{user_type} {user_id}가 채팅방 {room_id}에 입장했습니다.')
+        emit('joined_chat', {
+            'room_id': room_id,
+            'message': f'{user_type}가 채팅방에 입장했습니다.'
+        })
+        
+    except Exception as e:
+        emit('error', {'message': f'채팅방 입장 오류: {str(e)}'})
+
+@socketio.on('send_message')
+def handle_send_message(data):
+    """실시간 메시지 전송"""
+    try:
+        user_id = data.get('user_id')
+        coordinator_id = data.get('coordinator_id')
+        coordinator_name = data.get('coordinator_name')  # 프론트엔드에서 전송한 이름
+        message = data.get('message')
+        sender = data.get('sender')  # 'user' 또는 'coordinator'
+        
+        if not all([user_id, coordinator_id, message, sender]):
+            emit('error', {'message': '필수 정보가 누락되었습니다.'})
+            return
+        
+        # 채팅방 ID
+        room_id = f"chat_{user_id}_{coordinator_id}"
+        
+        # coordinator_name이 없으면 DB에서 조회
+        if not coordinator_name:
+            coordinator = User.query.filter_by(
+                coordinator_id=coordinator_id,
+                user_type='coordinator'
+            ).first()
+            
+            if coordinator:
+                coordinator_name = coordinator.name or coordinator.username or '코디네이터'
+            else:
+                coordinator_name = '코디네이터'
+        
+        # 메시지 데이터베이스에 저장
+        chat_data = {
+            'user_id': user_id,
+            'coordinator_id': coordinator_id,
+            'coordinator_name': coordinator_name,  # 실제 DB에서 조회한 이름
+            'message': message,
+            'sender': sender
+        }
+        
+        chat = Chat(**chat_data)
+        db.session.add(chat)
+        db.session.commit()
+        
+        # 실시간으로 메시지 전송
+        emit('new_message', {
+            'id': chat.id,
+            'message': message,
+            'sender': sender,
+            'timestamp': chat.created_at.isoformat(),
+            'user_id': user_id,
+            'coordinator_id': coordinator_id
+        }, room=room_id)
+        
+        print(f'메시지 전송: {sender} -> {room_id}')
+        
+    except Exception as e:
+        emit('error', {'message': f'메시지 전송 오류: {str(e)}'})
+
+@socketio.on('leave_chat')
+def handle_leave_chat(data):
+    """채팅방 퇴장"""
+    try:
+        user_id = data.get('user_id')
+        coordinator_id = data.get('coordinator_id')
+        
+        if user_id and coordinator_id:
+            room_id = f"chat_{user_id}_{coordinator_id}"
+            leave_room(room_id)
+            print(f'사용자 {user_id}가 채팅방 {room_id}에서 퇴장했습니다.')
+        
+    except Exception as e:
+        print(f'채팅방 퇴장 오류: {str(e)}')
+
+# 코디네이터 로그인 API
+@app.route('/api/coordinator/login', methods=['POST'])
+@cross_origin()
+def coordinator_login():
+    """코디네이터 로그인 API"""
+    try:
+        data = request.get_json()
+        print(f"코디네이터 로그인 요청 데이터: {data}")
+        username = data.get('username')
+        password = data.get('password')
+        
+        print(f"받은 username: {username}, password: {password}")
+        
+        if not username or not password:
+            return jsonify({"error": "사용자 이름과 비밀번호가 필요합니다."}), 400
+        
+        # 코디네이터 계정 조회 (username 또는 email로 조회)
+        coordinator = User.query.filter_by(
+            username=username, 
+            user_type='coordinator'
+        ).first()
+        
+        # username으로 찾지 못했으면 email로 조회
+        if not coordinator:
+            coordinator = User.query.filter_by(
+                email=username, 
+                user_type='coordinator'
+            ).first()
+        
+        # 모든 코디네이터 계정 확인 (디버깅용)
+        all_coordinators = User.query.filter_by(user_type='coordinator').all()
+        print(f"전체 코디네이터 계정 수: {len(all_coordinators)}")
+        for coord in all_coordinators:
+            print(f"  - ID: {coord.id}, username: {coord.username}, email: {coord.email}, name: {coord.name}")
+        
+        print(f"찾은 코디네이터: {coordinator}")
+        if coordinator:
+            print(f"찾은 코디네이터 정보:")
+            print(f"  - ID: {coordinator.id}")
+            print(f"  - username: {coordinator.username}")
+            print(f"  - email: {coordinator.email}")
+            print(f"  - name: {coordinator.name}")
+            print(f"  - user_type: {coordinator.user_type}")
+            print(f"비밀번호 확인 중...")
+            password_check = check_password_hash(coordinator.password_hash, password)
+            print(f"비밀번호 확인 결과: {password_check}")
+        else:
+            print("코디네이터를 찾을 수 없습니다.")
+        
+        if coordinator and check_password_hash(coordinator.password_hash, password):
+            # JWT 토큰 생성
+            token = generate_jwt_token(coordinator.id, username)
+            print(f"로그인 성공! 토큰 생성됨")
+            return jsonify({
+                "success": True,
+                "message": "코디네이터 로그인이 성공적으로 완료되었습니다.",
+                "username": username,
+                "name": coordinator.name,
+                "profile_image": coordinator.profile_image,
+                "coordinator_id": coordinator.coordinator_id,
+                "specialization": coordinator.specialization,
+                "token": token
+            }), 200
+        else:
+            print(f"로그인 실패 - 코디네이터: {coordinator is not None}, 비밀번호 확인: {coordinator and check_password_hash(coordinator.password_hash, password) if coordinator else False}")
+            return jsonify({"error": "잘못된 코디네이터 계정 정보입니다."}), 401
+            
+    except Exception as e:
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
+# 코디네이터 등록 API
+@app.route('/api/coordinator/register', methods=['POST'])
+@cross_origin()
+def coordinator_register():
+    """코디네이터 등록 API"""
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        email = data.get('email')
+        name = data.get('name')
+        specialization = data.get('specialization', '일반 상담')
+        
+        if not username or not password:
+            return jsonify({"error": "사용자 이름과 비밀번호가 필요합니다."}), 400
+        
+        # 기존 사용자 확인
+        existing_user = User.query.filter_by(username=username).first()
+        if existing_user:
+            return jsonify({"error": "이미 존재하는 사용자 이름입니다."}), 400
+        
+        # 코디네이터 ID 생성 (기존 코디네이터 수 + 1)
+        last_coordinator = User.query.filter_by(user_type='coordinator').order_by(User.coordinator_id.desc()).first()
+        coordinator_id = (last_coordinator.coordinator_id + 1) if last_coordinator else 1
+        
+        # 코디네이터 계정 생성
+        hashed_password = generate_password_hash(password)
+        new_coordinator = User(
+            username=username,
+            password_hash=hashed_password,
+            email=email,
+            name=name,
+            user_type='coordinator',
+            coordinator_id=coordinator_id,
+            specialization=specialization,
+            is_available=True
+        )
+        
+        db.session.add(new_coordinator)
+        db.session.commit()
+        
+        return jsonify({
+            "success": True,
+            "message": "코디네이터 등록이 성공적으로 완료되었습니다.",
+            "coordinator_id": coordinator_id
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"서버 오류: {str(e)}"}), 500
+
+# 코디네이터 대시보드 - 대기 중인 채팅 목록
+@app.route('/api/coordinator/chat-requests', methods=['GET'])
+@token_required
+def get_coordinator_chat_requests():
+    """코디네이터의 대기 중인 채팅 요청 목록"""
+    try:
+        print("코디네이터 채팅 요청 목록 조회 시작")
+        user_info = request.current_user
+        print(f"사용자 정보: {user_info}")
+        
+        coordinator_user = User.query.filter_by(id=user_info['user_id']).first()
+        print(f"코디네이터 사용자: {coordinator_user}")
+        
+        if not coordinator_user or coordinator_user.user_type != 'coordinator':
+            print("코디네이터 권한 없음")
+            return jsonify({"error": "코디네이터 권한이 필요합니다."}), 403
+        
+        coordinator_id = coordinator_user.coordinator_id
+        print(f"코디네이터 ID: {coordinator_id}")
+        
+        # 해당 코디네이터와 채팅한 사용자 목록 조회
+        chat_requests = db.session.query(
+            Chat.user_id,
+            User.username,
+            db.func.max(Chat.created_at).label('last_message_time'),
+            db.func.count(Chat.id).label('message_count')
+        ).join(User, Chat.user_id == User.id)\
+         .filter(Chat.coordinator_id == coordinator_id)\
+         .group_by(Chat.user_id, User.username)\
+         .order_by(db.func.max(Chat.created_at).desc())\
+         .all()
+        
+        requests_data = []
+        for chat_request in chat_requests:
+            # 마지막 메시지 조회
+            last_message = Chat.query.filter_by(
+                user_id=chat_request.user_id,
+                coordinator_id=coordinator_id
+            ).order_by(Chat.created_at.desc()).first()
+            
+            requests_data.append({
+                'user_id': chat_request.user_id,
+                'username': chat_request.username,
+                'last_message': last_message.message if last_message else '',
+                'last_message_time': last_message.created_at.isoformat() if last_message else '',
+                'message_count': chat_request.message_count,
+                'unread_count': 0  # is_read 필드가 없으므로 임시로 0으로 설정
+            })
+        
+        return jsonify({
+            'success': True,
+            'chat_requests': requests_data
+        })
+        
+    except Exception as e:
+        print(f"코디네이터 채팅 요청 목록 조회 오류: {str(e)}")
+        import traceback
+        print(f"전체 트레이스백:\n{traceback.format_exc()}")
+        return jsonify({
+            'success': False,
+            'error': f'채팅 요청 목록 조회 실패: {str(e)}'
+        }), 500
+
+@app.route('/api/coordinators', methods=['GET'])
+@cross_origin()
+def get_coordinators():
+    """등록된 코디네이터 목록 조회"""
+    try:
+        coordinators = User.query.filter_by(user_type='coordinator').all()
+        
+        coordinators_data = []
+        for coordinator in coordinators:
+            coordinators_data.append({
+                'id': coordinator.coordinator_id,
+                'name': coordinator.name or coordinator.username,
+                'username': coordinator.username,
+                'email': coordinator.email,
+                'specialization': coordinator.specialization or '일반 상담',
+                'is_available': coordinator.is_available,
+                'profile': coordinator.profile_image or f"/src/imgdata/icon/마음코디네이터{coordinator.coordinator_id}.png"  # 프로필 이미지 또는 기본 이미지
+            })
+        
+        return jsonify({
+            'success': True,
+            'coordinators': coordinators_data
+        })
+        
+    except Exception as e:
+        print(f"코디네이터 목록 조회 오류: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'코디네이터 목록 조회 실패: {str(e)}'
+        }), 500
+
 if __name__ == '__main__':
     print("MindCanvas Backend 서버를 시작합니다...")
     print("=" * 60)
     print(f"로드된 YOLOv5 모델: {list(yolo_analyzer.models.keys())}")
     print(f"로드된 HTP 분석 기준: {len(htp_analyzer.htp_criteria)}개")
     print("서버 주소: http://localhost:5000")
+    print("WebSocket 지원: 활성화")
     print("=" * 60)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
