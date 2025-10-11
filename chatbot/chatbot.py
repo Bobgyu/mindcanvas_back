@@ -522,10 +522,11 @@ def get_system_prompt():
             prompt += f"상담사: {example.get('assistant', '')}\n\n"
     
     prompt += """당신의 역할:
-1. 이미지 분석 결과를 받으면 HTP 기준에 따라 심리적 해석을 제공
-2. 각 특징별로 점수를 계산하고 위험도를 평가
-3. 구체적이고 실용적인 상담 조언 제공
-4. 미술심리상담과 그림 해석 관련 질문만 답변"""
+1. 이미지 분석 결과를 받으면 HTP 기준에 따라 따뜻하고 이해심 있는 심리적 해석을 제공
+2. 점수나 위험도보다는 관찰된 특징들을 부드럽게 설명
+3. 구체적이고 실용적인 상담 조언을 친근한 말투로 제공
+4. 미술심리상담과 그림 해석 관련 질문만 답변
+5. "총 점수 0점" 같은 표현은 사용하지 말고, 대신 "다양한 특징들이 관찰됩니다" 같은 자연스러운 표현 사용"""
     
     return prompt
 
@@ -548,19 +549,25 @@ def process_query(query, conversation_history, image_analysis_result=None):
         analysis_result = analyze_image_features(image_analysis_result)
         
         if "error" not in analysis_result:
+            # 위험도별 부드러운 표현
+            risk_descriptions = {
+                'high': '몇 가지 주의가 필요한 부분들이 보입니다',
+                'moderate': '일부 관심이 필요한 부분들이 있습니다',
+                'normal': '전반적으로 안정적인 모습을 보입니다',
+                'positive': '긍정적인 특징들이 잘 나타나고 있습니다'
+            }
+            
             analysis_summary = f"""
-이미지 분석 결과:
+그림을 분석해보니 {risk_descriptions.get(analysis_result['risk_level'], '다양한 특징들이 관찰됩니다')}.
 
-총 점수: {analysis_result['total_score']}
-위험도: {analysis_result['risk_level']}
-
-객체별 분석:
+주요 관찰 사항:
 """
             
             for obj_id, obj_data in analysis_result['objects'].items():
-                analysis_summary += f"\n{obj_data['label']} (점수: {obj_data['score']}):\n"
-                for interpretation in obj_data['interpretations']:
-                    analysis_summary += f"- {interpretation['feature']}: {interpretation['interpretation']} (심각도: {interpretation['severity']})\n"
+                if obj_data['interpretations']:  # 해석이 있는 경우만 포함
+                    analysis_summary += f"\n{obj_data['label']}에서:\n"
+                    for interpretation in obj_data['interpretations']:
+                        analysis_summary += f"- {interpretation['feature']}: {interpretation['interpretation']}\n"
             
             enhanced_query = f"{query}\n\n{analysis_summary}"
         else:
@@ -587,20 +594,19 @@ def process_image_analysis(image_analysis_result: Dict[str, Any]) -> str:
     if "error" in analysis_result:
         return f"이미지 분석 중 오류가 발생했습니다: {analysis_result['error']}"
     
-    # 위험도별 라벨 매핑
-    risk_labels = {
-        'high': '🔴 위험 신호 다수',
-        'moderate': '⚠️ 위험 단서 일부', 
-        'normal': '📝 일반적 수준',
-        'positive': '✅ 적응적 단서 우세'
+    # 위험도별 부드러운 표현
+    risk_descriptions = {
+        'high': '몇 가지 주의가 필요한 부분들이 관찰됩니다',
+        'moderate': '일부 관심이 필요한 부분들이 있습니다', 
+        'normal': '전반적으로 안정적인 모습을 보입니다',
+        'positive': '긍정적인 특징들이 잘 나타나고 있습니다'
     }
     
     report = f"""
 === HTP 그림 해석 분석 보고서 ===
 
 📊 전체 평가
-- 총 점수: {analysis_result['total_score']}
-- 위험도: {risk_labels.get(analysis_result['risk_level'], '알 수 없음')}
+{risk_descriptions.get(analysis_result['risk_level'], '다양한 특징들이 관찰됩니다')}
 
 📋 객체별 상세 분석
 """
@@ -615,7 +621,7 @@ def process_image_analysis(image_analysis_result: Dict[str, Any]) -> str:
         else:
             emoji = '📝'
             
-        report += f"\n{emoji} {obj_data['label']} (점수: {obj_data['score']})\n"
+        report += f"\n{emoji} {obj_data['label']}\n"
         report += "=" * 30 + "\n"
         
         if obj_data['interpretations']:
